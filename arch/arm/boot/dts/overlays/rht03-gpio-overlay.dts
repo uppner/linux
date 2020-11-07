@@ -1,0 +1,40 @@
+// Definitions for rht03-gpio module (without external pullup)
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+
+			rht03: rhtwire@0 {
+				compatible = "rht03-gpio";
+				pinctrl-names = "default";
+				pinctrl-0 = <&rht03_pins>;
+				gpios = <&gpio 4 0>;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&gpio>;
+		__overlay__ {
+			rht03_pins: rht03_pins@0 {
+				brcm,pins = <4>;
+				brcm,function = <0>; // in (initially)
+				brcm,pull = <0>; // off
+			};
+		};
+	};
+
+	__overrides__ {
+		gpiopin =       <&rht03>,"gpios:4",
+				<&rht03>,"reg:0",
+				<&rht03_pins>,"brcm,pins:0",
+				<&rht03_pins>,"reg:0";
+		pullup;		// Silently ignore unneeded parameter
+	};
+};
