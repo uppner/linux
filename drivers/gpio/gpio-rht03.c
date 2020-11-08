@@ -1,5 +1,5 @@
-
 #include <linux/init.h>
+#include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -10,8 +10,12 @@
 #include <linux/of.h>
 #include <linux/delay.h>
 #include <asm/irq.h>
+#include <linux/cdev.h>
+#include <linux/miscdevice.h>
 
 #define DEVICE_NAME "rht03"
+#define IOCTL_TRIG 1
+#define IOCTL_READ 2
 
 #define SHORT_PULSE_NS 80000
 #define LONG_PULSE_NS 120000
@@ -19,8 +23,16 @@
 #define TOLERANCE_HIGH 30000
 #define PATTERN_LENGTH 32 
 
+struct rht03_gpio_platform_data; 
+
 static int rht03_gpio_probe(struct platform_device *pdev); 
 static int rht03_gpio_remove(struct platform_device *pdev); 
+static long rht03_ioctl(struct file*, unsigned int, unsigned long);
+
+static int init_device(struct platform_device *,
+		struct rht03_gpio_platform_data **);
+static void trig_reading(struct rht03_gpio_platform_data *pdata);
+static irqreturn_t gpio_irq_handler(int, void *);
 
 struct rht03_gpio_platform_data {
 	struct gpio_desc *gpiod;
@@ -30,53 +42,17 @@ struct rht03_gpio_platform_data {
 	int index;
 	u32 values;
 	u64 previous_timestamp;
+	long current_value;
+	int current_valid;
 	int irq;
+        struct miscdevice mdev;
+        struct platform_device *pdev;
 };
 
-static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
+struct file_operations rht03_fops =
 {
-	u64 timestamp = ktime_get_ns();
-	struct rht03_gpio_platform_data *pdata = dev_id;
-	u64 timediff;
-
-	//printk("IRQ %d fired at %llu, index=%d", irq, timestamp, pdata->index);
-
-	if (dev_id == NULL)
-	{
-		printk("IRQ dev_id==NULL\n");
-		goto out;
-	}
-
-	if (pdata->index >= 0 && pdata->index < PATTERN_LENGTH-1)
-	{
-		timediff = timestamp - pdata->previous_timestamp;
-
-		if (SHORT_PULSE_NS - TOLERANCE < timediff && timediff < SHORT_PULSE_NS + TOLERANCE)
-		{
-			printk("0, diff=%llu\n", timediff);
-		}
-		else if (LONG_PULSE_NS - TOLERANCE < timediff && timediff < LONG_PULSE_NS + TOLERANCE_HIGH)
-		{
-			pdata->values |= (1<<(PATTERN_LENGTH - 1 - pdata->index));
-			printk("1, diff=%llu\n", timediff);
-			printk("VALUE: 0x%x\n", pdata->values);
-		}
-		else
-		{
-			printk("? diff=%llu\n", timediff);
-			printk("Invalid pulse length\n");
-		}
-	}
-	else if (pdata->index == PATTERN_LENGTH-1)
-	{
-		printk("\nFINAL SVALUE: 0x%x\n", pdata->values);
-	}
-
-	pdata->index++;
-	pdata->previous_timestamp = timestamp;
-out:
-	return IRQ_HANDLED;
-}
+	.unlocked_ioctl = rht03_ioctl
+};
 
 #if defined(CONFIG_OF)
 static const struct of_device_id rht03_gpio_dt_ids[] = {
@@ -95,7 +71,61 @@ static struct platform_driver rht03_gpio_driver = {
 	.remove = rht03_gpio_remove,
 };
 
+static int next_node;
+static dev_t device_number;
+struct class *rht03_class;
+struct cdev rht03_cdev;
+
 static int rht03_gpio_probe(struct platform_device *pdev)
+{
+	int result, ret;
+	struct rht03_gpio_platform_data *pdata;
+
+	result = init_device(pdev, &pdata);
+	if (result != 0) {
+		return result;
+	}
+	platform_set_drvdata(pdev, pdata);
+        pdata->pdev = pdev;
+
+        pdata->mdev.minor = MISC_DYNAMIC_MINOR;
+        pdata->mdev.name = "rht03";
+        pdata->mdev.fops = &rht03_fops;
+        pdata->mdev.parent = NULL; 
+
+        ret = misc_register(&pdata->mdev);
+        if (ret) {
+                dev_err(&pdev->dev, "Failed to register rht03 miscdev\n");
+        }
+
+        dev_info(&pdev->dev, "Registered\n");
+
+
+        trig_reading(pdata);
+
+
+
+	return 0;
+}
+
+static int rht03_gpio_remove(struct platform_device *pdev)
+{
+	struct rht03_gpio_platform_data *pdata = dev_get_platdata(&pdev->dev);
+
+        misc_deregister(&pdata->mdev);
+
+	if (pdata->enable_external_pullup)
+		pdata->enable_external_pullup(0);
+
+	if (pdata->pullup_gpiod)
+		gpiod_set_value(pdata->pullup_gpiod, 0);
+
+
+	return 0;
+} 
+
+static int init_device(struct platform_device *pdev,
+		struct rht03_gpio_platform_data **pdata_out)
 {
 	struct rht03_gpio_platform_data *pdata;
 	struct device *dev = &pdev->dev;
@@ -103,9 +133,7 @@ static int rht03_gpio_probe(struct platform_device *pdev)
 
 	/* Enforce open drain mode by default */
 	enum gpiod_flags gflags = GPIOD_OUT_HIGH_OPEN_DRAIN;
-	int i, high, ret;
 
-	printk("rht03_gpio_probe()\n");
 
 	if (of_have_populated_dt()) {
 		pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
@@ -130,9 +158,8 @@ static int rht03_gpio_probe(struct platform_device *pdev)
 		return -ENXIO;
 	}
 
-	pdata->index = -3;
-	pdata->previous_timestamp = 0;
-	pdata->values = 0x0000;
+	*pdata_out = pdata;
+
 
 	pdata->gpiod = devm_gpiod_get_index(dev, NULL, 0, gflags);
 	if (IS_ERR(pdata->gpiod)) {
@@ -148,14 +175,23 @@ static int rht03_gpio_probe(struct platform_device *pdev)
 		return PTR_ERR(pdata->pullup_gpiod);
 	}
 
-	gpiod_direction_output(pdata->gpiod, 1);
-
 	pdata->irq = gpiod_to_irq(pdata->gpiod);
 
-	ret = devm_request_irq(&pdev->dev,
+	return devm_request_irq(&pdev->dev,
 					pdata->irq, gpio_irq_handler,
 					IRQF_TRIGGER_RISING, pdev->name,
 					pdata);
+}
+
+static void trig_reading(struct rht03_gpio_platform_data *pdata)
+{
+	int high, i;
+	pdata->index = -3;
+	pdata->previous_timestamp = 0;
+	pdata->values = 0;
+	pdata->current_valid = 0;
+
+	gpiod_direction_output(pdata->gpiod, 1);
 
 	high = 0;
 	for (i = 0; i < 2; ++i)
@@ -164,69 +200,102 @@ static int rht03_gpio_probe(struct platform_device *pdev)
 		high = !high;
 		udelay(1100);
 	}
+
 	gpiod_direction_input(pdata->gpiod);
 
-	printk("IRQ: %d\n", pdata->irq);
-
-	if (ret == 0)
-	{
-		printk("IRQ enabled\n");
-	}
-	else
-	{
-		printk("Could not request irq, ret: %d\n", ret);
-		return -1;
-	}
-
-	platform_set_drvdata(pdev, pdata);
-
-	return 0;
 }
-static int rht03_gpio_remove(struct platform_device *pdev)
+static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
 {
-	struct rht03_gpio_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	u64 timestamp = ktime_get_ns();
+	u64 timediff;
+	struct rht03_gpio_platform_data *pdata = dev_id;
 
-	printk("rht03_gpio_remove()\n");
+	if (dev_id == NULL) {
+		printk("IRQ dev_id==NULL\n");
+		goto out;
+	}
 
-	if (pdata->enable_external_pullup)
-		pdata->enable_external_pullup(0);
+	if (pdata->index >= 0 && pdata->index < PATTERN_LENGTH-1) {
+		timediff = timestamp - pdata->previous_timestamp;
 
-	if (pdata->pullup_gpiod)
-		gpiod_set_value(pdata->pullup_gpiod, 0);
+		if (SHORT_PULSE_NS - TOLERANCE < timediff && 
+			timediff < SHORT_PULSE_NS + TOLERANCE) {
+			// Do nothing
+		}
+		else if (LONG_PULSE_NS - TOLERANCE < timediff &&
+			timediff < LONG_PULSE_NS + TOLERANCE_HIGH) {
+			pdata->values |= (1<<(PATTERN_LENGTH - 1 - pdata->index));
+		}
+		else {
+			printk("? diff=%llu\n", timediff);
+			printk("Invalid pulse length\n");
+			pdata->current_valid = -1;
+		}
+	}
+	else if (pdata->index == PATTERN_LENGTH-1) {
+		if (pdata->current_valid == 0) {
+			pdata->current_value = pdata->values;
+			pdata->current_valid = 1;
+			printk("\nFINAL VALUE: 0x%x\n", pdata->values);
+		}
+		else {
+			printk("\nInvalid value: 0x%x\n", pdata->values);
+		}
+	}
 
-	return 0; } 
+	pdata->index++;
+	pdata->previous_timestamp = timestamp;
+out:
+	return IRQ_HANDLED;
+}
+
+static long rht03_ioctl(struct file *filp,
+	unsigned int ioctl_num,
+	unsigned long ioctl_param)
+{
+        struct miscdevice *miscdev = filp->private_data;
+        struct rht03_gpio_platform_data *pdata = container_of(miscdev, struct rht03_gpio_platform_data, mdev);
+
+        if (ioctl_num == IOCTL_TRIG) {
+                trig_reading(pdata);
+                return 0;
+        } else if (ioctl_num  == IOCTL_READ) {
+                if (pdata->current_valid == 1) {
+                        return pdata->current_value;
+                } else {
+                        return -EIO;
+                }
+        }
+
+        return -EINVAL;
+
+}
+
 static int rht03_init(void)
 {
-	printk("rht03 module_init()\n");
+	next_node = 0;
+	alloc_chrdev_region(&device_number, 0, 1, "gpio-rht03");
+	rht03_class = class_create(THIS_MODULE, "rht03_class");
+
+	cdev_init(&rht03_cdev, &rht03_fops);
+	rht03_cdev.owner = THIS_MODULE;
+	cdev_add(&rht03_cdev, device_number, 1);
+
 	platform_driver_register(&rht03_gpio_driver);
 	return 0;
 }
 
 static void rht03_exit(void)
 {
-	printk("rht03 module_exit()\n");
+        class_destroy(rht03_class);
+	unregister_chrdev_region(device_number, 1); 
 	platform_driver_unregister(&rht03_gpio_driver);
 }
-/*
-// Anpassning w1/masters/w1-gpio.c
-static void w1_gpio_write_bit(struct w1_gpio_platform_data *pdata, u8 bit)
-{
-	gpiod_set_value(pdata->gpiod, bit);
-}
-
-// Anpassning w1/masters/w1-gpio.c
-static u8 w1_gpio_read_bit(struct w1_gpio_platform_data *pdata)
-{
-	return gpiod_get_value(pdata->gpiod) ? 1 : 0;
-}
-*/
-
-
 
 module_init(rht03_init);
 module_exit(rht03_exit);
 
-
 MODULE_DESCRIPTION("RHT03 GPIO driver");
-MODULE_AUTHOR("Wille");
+MODULE_AUTHOR("William Arvidsson");
 MODULE_LICENSE("GPL");
+
