@@ -1,0 +1,14 @@
+KERNEL=kernel7l
+make bcm2711_defconfig
+Change CONFIG_LOCALVERSION in .config
+
+make -j4 zImage modules dtbs
+
+sudo make modules_install
+sudo cp arch/arm/boot/dts/*.dtb /boot/
+sudo cp arch/arm/boot/dts/overlays/*.dtb* /boot/overlays/
+sudo cp arch/arm/boot/dts/overlays/README /boot/overlays/
+sudo cp arch/arm/boot/zImage /boot/$KERNEL.img
+
+Add "dtoverlay=rht03-gpio" to /boot/config.txt
+
