@@ -14,8 +14,8 @@
 #include <linux/miscdevice.h>
 
 #define DEVICE_NAME "rht03"
-#define IOCTL_TRIG 1
-#define IOCTL_READ 2
+#define IOCTL_TRIG 7000
+#define IOCTL_READ 7001 
 
 #define SHORT_PULSE_NS 80000
 #define LONG_PULSE_NS 120000
@@ -42,7 +42,7 @@ struct rht03_gpio_platform_data {
 	int index;
 	u32 values;
 	u64 previous_timestamp;
-	long current_value;
+	u32 current_value;
 	int current_valid;
 	int irq;
         struct miscdevice mdev;
@@ -99,11 +99,6 @@ static int rht03_gpio_probe(struct platform_device *pdev)
         }
 
         dev_info(&pdev->dev, "Registered\n");
-
-
-        trig_reading(pdata);
-
-
 
 	return 0;
 }
@@ -255,12 +250,16 @@ static long rht03_ioctl(struct file *filp,
 {
         struct miscdevice *miscdev = filp->private_data;
         struct rht03_gpio_platform_data *pdata = container_of(miscdev, struct rht03_gpio_platform_data, mdev);
+        
+        printk("ioctl_num: %x\n", ioctl_num);
 
         if (ioctl_num == IOCTL_TRIG) {
                 trig_reading(pdata);
                 return 0;
         } else if (ioctl_num  == IOCTL_READ) {
+                printk("current_valid: %x\n", pdata->current_valid);
                 if (pdata->current_valid == 1) {
+                        printk("current_value: %x\n", pdata->current_value);
                         return pdata->current_value;
                 } else {
                         return -EIO;
